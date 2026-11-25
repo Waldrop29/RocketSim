@@ -9,20 +9,23 @@ pygame.init()
 pygame.font.init()  # Initialize font system for the HUD text
 pygame.joystick.init()
 
-if pygame.joystick.get_count() == 0:
-    print("MISSION CONTROL ERROR: No HOTAS hardware link established.")
-    sys.exit()
-
-hotas = pygame.joystick.Joystick(0)
-hotas.init()
+hotas = None
+if pygame.joystick.get_count() > 0:
+    hotas = pygame.joystick.Joystick(0)
+    hotas.init()
+    print("HOTAS link established.")
+else:
+    print("No HOTAS detected. Keyboard docking controls enabled.")
 
 # --- WINDOW CONFIGURATION ---
 WIDTH, HEIGHT = 1000, 800  
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("Vanguard Mk-1 Flight Systems Interface")
 
-# Setup big typography for the capture alert
+# Docking HUD typography
 HUDFont = pygame.font.SysFont("Courier", 72, bold=True)
+HelpFont = pygame.font.SysFont("Courier", 12, bold=True)
+CaptureSubFont = pygame.font.SysFont("Courier", 22, bold=True)
 
 # --- COLOR SCHEMES ---
 SPACE_BLACK = (5, 5, 10)
@@ -33,7 +36,7 @@ EXHAUST_RED = (255, 50, 50)
 TARGET_GOLD = (230, 190, 30)
 PANEL_GREY  = (35, 38, 42)
 
-# --- PHYSICAL USB HARDWARE MAPPING ---
+# --- OPTIONAL HOTAS MAPPING ---
 ROLL_AXIS       = 0       
 THROTTLE_AXIS   = 2   
 LEFT_BRAKE_AXIS = 3  
@@ -73,7 +76,9 @@ last_frame_time = time.time()
 try:
     while True:
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
+            if event.type == pygame.QUIT or (
+                event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+            ):
                 pygame.quit()
                 sys.exit()
         
@@ -82,30 +87,37 @@ try:
         dt = current_frame_time - last_frame_time
         last_frame_time = current_frame_time
         
-        # 1. READ CONTROLS (Only if we haven't locked down for final capture!)
+        # Keyboard: W/S translate forward/back, A/D strafe, Q/E yaw, Space probe.
         if mission_state != "CAPTURED":
-            roll_input   = hotas.get_axis(ROLL_AXIS)
-            raw_throttle = hotas.get_axis(THROTTLE_AXIS)
-            yaw_input    = hotas.get_axis(YAW_AXIS) 
-            left_toe  = (hotas.get_axis(LEFT_BRAKE_AXIS) + 1.0) / 2.0
-            right_toe = (hotas.get_axis(RIGHT_BRAKE_AXIS) + 1.0) / 2.0
-            trigger_pressed = hotas.get_button(TOGGLE_BUTTON)
+            if hotas is not None:
+                roll_input = hotas.get_axis(ROLL_AXIS)
+                raw_throttle = hotas.get_axis(THROTTLE_AXIS)
+                yaw_input = hotas.get_axis(YAW_AXIS)
+                left_toe = (hotas.get_axis(LEFT_BRAKE_AXIS) + 1.0) / 2.0
+                right_toe = (hotas.get_axis(RIGHT_BRAKE_AXIS) + 1.0) / 2.0
+                trigger_pressed = hotas.get_button(TOGGLE_BUTTON)
+            else:
+                keys = pygame.key.get_pressed()
+                roll_input = float(keys[pygame.K_e]) - float(keys[pygame.K_q])
+                raw_throttle = float(keys[pygame.K_s]) - float(keys[pygame.K_w])
+                yaw_input = 0.0
+                left_toe = float(keys[pygame.K_a])
+                right_toe = float(keys[pygame.K_d])
+                trigger_pressed = bool(keys[pygame.K_SPACE])
         else:
-            # Completely freeze hardware controls post-capture
+            # Freeze controls after capture.
             roll_input = raw_throttle = yaw_input = left_toe = right_toe = 0.0
             trigger_pressed = False
         
         # 2. PROBE TOGGLE LOGIC
-        if trigger_pressed:
-            if not button_state_lock:
-                # If we are locked to the magnet, clicking the trigger initiates retraction
-                if mission_state == "DOCKED":
-                    mission_state = "RETRACTING"
-                    probe_extended = False 
-                elif mission_state == "FLYING":
-                    probe_extended = not probe_extended
-                button_state_lock = True
-        else:
+        if trigger_pressed and not button_state_lock:
+            if mission_state == "DOCKED":
+                mission_state = "RETRACTING"
+                probe_extended = False
+            elif mission_state == "FLYING":
+                probe_extended = not probe_extended
+            button_state_lock = True
+        elif not trigger_pressed:
             button_state_lock = False
 
         thrust_level = (1.0 - raw_throttle) / 2.0
@@ -116,16 +128,21 @@ try:
             ship_roll += (roll_input * 100.0) * dt
             ship_roll %= 360.0
             
-            thrust_vector = thrust_level - 0.5
-            vel_y -= (thrust_vector * 2.0 * THRUST_MODIFIER) * dt
-            vel_x += (yaw_input * LATERAL_MODIFIER) * dt
-            strafe_force = right_toe - left_toe
-            vel_x += (strafe_force * LATERAL_MODIFIER) * dt
+            forward_accel = (thrust_level - 0.5) * 2.0 * THRUST_MODIFIER
+            strafe_accel = (yaw_input + right_toe - left_toe) * LATERAL_MODIFIER
+            heading_radians = math.radians(ship_roll)
+            forward_x = math.sin(heading_radians)
+            forward_y = -math.cos(heading_radians)
+            right_x = math.cos(heading_radians)
+            right_y = math.sin(heading_radians)
+            vel_x += (forward_x * forward_accel + right_x * strafe_accel) * dt
+            vel_y += (forward_y * forward_accel + right_y * strafe_accel) * dt
             
             ship_x += vel_x * dt
             ship_y += vel_y * dt
-            vel_x *= MOMENTUM_RETENTION
-            vel_y *= MOMENTUM_RETENTION
+            retention = MOMENTUM_RETENTION ** (dt * 60.0)
+            vel_x *= retention
+            vel_y *= retention
 
         elif mission_state == "DOCKED":
             # IMMOBILIZED: Magnet holds the ship rigid in space.
@@ -219,15 +236,28 @@ try:
             indicator_color = WHITE
             
         pygame.draw.circle(screen, indicator_color, (85, HEIGHT-95), 7)
+        controls_surface = HelpFont.render(
+            "W/S TRANSLATE  A/D STRAFE  Q/E YAW  SPACE PROBE",
+            True,
+            WHITE,
+        )
+        screen.blit(controls_surface, controls_surface.get_rect(center=(WIDTH // 2, HEIGHT - 23)))
         
         # -------------------------------------------------------------------
         # LAYER 4: HEAVY HUD ALERT OVERLAY (Renders "CAPTURE" Text)
         # -------------------------------------------------------------------
-        if mission_state == "CAPTURED":
+        if mission_state in ("DOCKED", "RETRACTING", "CAPTURED"):
             text_surface = HUDFont.render("CAPTURE", True, HULL_GREEN)
-            # Center the bounding box perfectly over the cockpit window space
             text_rect = text_surface.get_rect(center=(WIDTH // 2, HEIGHT // 3))
             screen.blit(text_surface, text_rect)
+        if mission_state in ("RETRACTING", "CAPTURED"):
+            subtitle = CaptureSubFont.render(
+                "Houston, we have hard dock.", True, WHITE
+            )
+            subtitle_rect = subtitle.get_rect(
+                center=(WIDTH // 2, HEIGHT // 3 + 62)
+            )
+            screen.blit(subtitle, subtitle_rect)
         
         pygame.display.flip()
         clock.tick(60)
